@@ -37,7 +37,26 @@ void setup() {
   LoRa.setSPI(SPI);
   LoRa.setPins(LORA_SS, LORA_RST, LORA_DIO0);
 
-  // 2. Inisialisasi Frekuensi Radio (Coba 915 MHz, fallback ke 433 MHz)
+  // 2. Validasi Koneksi Fisik SPI ke Chip SX1276
+  pinMode(LORA_SS, OUTPUT);
+  digitalWrite(LORA_SS, LOW);
+  SPI.transfer(0x42 & 0x7F);              // Baca RegVersion (0x42)
+  uint8_t chipVersion = SPI.transfer(0x00);
+  digitalWrite(LORA_SS, HIGH);
+
+  Serial.printf("[SPI CHECK] Silicon Version Register (0x42): 0x%02X\n", chipVersion);
+  if (chipVersion != 0x12) {
+    Serial.println("\n[ERROR] Koneksi SPI ke modul LoRa Ra-02 GAGAL!");
+    Serial.printf("        Nilai terbaca: 0x%02X (Ekspektasi: 0x12)\n", chipVersion);
+    Serial.println("        Panduan Cepat:");
+    Serial.println("        - 0x00: Periksa kabel daya 3.3V, GND, atau jalur SCK/MOSI.");
+    Serial.println("        - 0xFF: Periksa kabel MISO (GPIO 19) atau NSS (GPIO 5) yang mungkin lepas/kendor.");
+    Serial.println("        Program dihentikan untuk mencegah kerusakan.\n");
+    while (1) { delay(1000); }
+  }
+  Serial.println("[SPI CHECK] Modul SX1276 terdeteksi normal (0x12). Melanjutkan inisialisasi RF...");
+
+  // 3. Inisialisasi Frekuensi Radio (Coba 915 MHz, fallback ke 433 MHz)
   if (!LoRa.begin(915000000L)) {
     Serial.println("[INFO] Gagal pada 915 MHz, mencoba frekuensi 433 MHz...");
     if (!LoRa.begin(433000000L)) {
