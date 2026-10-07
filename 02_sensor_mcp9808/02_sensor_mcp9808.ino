@@ -18,7 +18,7 @@ uint8_t scanMCP9808() {
   for (uint8_t addr = 0x18; addr <= 0x1F; addr++) {
     Wire.beginTransmission(addr);
     Wire.write(0x06); // Register Manufacturer ID (Harus 0x0054 untuk Microchip)
-    if (Wire.endTransmission(false) == 0) {
+    if (Wire.endTransmission() == 0) {
       Wire.requestFrom(addr, (uint8_t)2);
       if (Wire.available() >= 2) {
         uint16_t mfgID = (Wire.read() << 8) | Wire.read();
@@ -33,7 +33,7 @@ uint8_t scanMCP9808() {
 float readTemperature(uint8_t addr) {
   Wire.beginTransmission(addr);
   Wire.write(0x05);
-  if (Wire.endTransmission(false) != 0) return -999.0f;
+  if (Wire.endTransmission() != 0) return -999.0f;
 
   Wire.requestFrom(addr, (uint8_t)2);
   if (Wire.available() < 2) return -999.0f;

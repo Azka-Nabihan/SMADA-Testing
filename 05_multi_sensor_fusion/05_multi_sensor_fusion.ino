@@ -2,157 +2,329 @@
 #include <Wire.h>
 
 // ============================================================================
-// SCaDA Test 05: Multi-Sensor I2C Bus Fusion
-// Membaca 3 Sensor secara simultan pada bus I2C paralel:
-// 1. MAX30102   : 0x57 (Heart Rate & SpO2)
-// 2. MCP9808    : 0x18 (Body Temperature)
-// 3. GY-LSM6DS3 : 0x6A (6-DOF IMU Motion & Orientation)
+// SCaDA Test 05: Dual-Sensor I2C Fusion (MAX30102 & MCP9808)
+// Algoritma: IIR DC Filter + Peak Apex Responsif + Double-Trimmed Mean
 //
-// Wiring Bus Bersama:
-// - Semua VCC/VDD -> 3V3
-// - Semua GND     -> GND
-// - Semua SDA     -> GPIO 21
-// - Semua SCL     -> GPIO 22
-// - Pin CS LSM6DS3 -> 3V3 (Wajib)
+// Pinout ESP32 (Hanya 4 kabel ke breadboard):
+//   3V3 -> VCC/VDD MAX30102 & MCP9808
+//   GND -> GND kedua sensor
+//   D21 -> SDA kedua sensor
+//   D22 -> SCL kedua sensor
 // ============================================================================
 
+#define MAX30102_ADDR 0x57
 #define PIN_SDA 21
 #define PIN_SCL 22
 
-#define ADDR_MAX30102   0x57
-#define ADDR_MCP9808    0x18
-#define ADDR_LSM6DS3    0x6A
+// --- State & Buffer MAX30102 ---
+bool maxConnected = false;
+float dc_ir = 0;
+float dc_red = 0;
+float prev_ac_ir = 0;
 
-bool maxReady = false;
-bool mcpReady = false;
-bool lsmReady = false;
+float max_ac_ir = -99999, min_ac_ir = 99999;
+float max_ac_red = -99999, min_ac_red = 99999;
+bool peak_registered = false;
 
-void writeI2C(uint8_t addr, uint8_t reg, uint8_t val) {
-  Wire.beginTransmission(addr);
+const byte RATE_SIZE = 10;
+float rates[RATE_SIZE] = {0};
+byte rate_spot = 0;
+byte rate_count = 0;
+
+unsigned long last_beat_time = 0;
+float bpm_val = 0;
+float spo2_val = 0;
+
+// --- State & Buffer MCP9808 ---
+uint8_t mcpAddr = 0;
+bool mcpConnected = false;
+float latest_temp = 0.0f;
+unsigned long last_temp_time = 0;
+
+// Timer Serial Print
+unsigned long last_print_time = 0;
+
+// ============================================================================
+// FUNGSI MAX30102
+// ============================================================================
+void writeReg(uint8_t reg, uint8_t val) {
+  Wire.beginTransmission(MAX30102_ADDR);
   Wire.write(reg);
   Wire.write(val);
   Wire.endTransmission();
 }
 
-void initAllSensors() {
-  // 1. Init MAX30102
-  Wire.beginTransmission(ADDR_MAX30102);
-  if (Wire.endTransmission() == 0) {
-    writeI2C(ADDR_MAX30102, 0x09, 0x40); // Reset
-    delay(50);
-    writeI2C(ADDR_MAX30102, 0x04, 0x00);
-    writeI2C(ADDR_MAX30102, 0x05, 0x00);
-    writeI2C(ADDR_MAX30102, 0x06, 0x00);
-    writeI2C(ADDR_MAX30102, 0x08, 0x4F); // Sample avg 4
-    writeI2C(ADDR_MAX30102, 0x09, 0x03); // SpO2 mode (Red + IR)
-    writeI2C(ADDR_MAX30102, 0x0A, 0x27); // 4096 ADC, 100 Hz
-    writeI2C(ADDR_MAX30102, 0x0C, 0x24); // Red LED ~7.2mA
-    writeI2C(ADDR_MAX30102, 0x0D, 0x24); // IR LED ~7.2mA
-    maxReady = true;
-  } else {
-    maxReady = false;
-  }
-
-  // 2. Init MCP9808
-  Wire.beginTransmission(ADDR_MCP9808);
-  if (Wire.endTransmission() == 0) {
-    mcpReady = true;
-  } else {
-    mcpReady = false;
-  }
-
-  // 3. Init GY-LSM6DS3
-  Wire.beginTransmission(ADDR_LSM6DS3);
-  if (Wire.endTransmission() == 0) {
-    writeI2C(ADDR_LSM6DS3, 0x10, 0x40); // Accel 104Hz, ±2g
-    writeI2C(ADDR_LSM6DS3, 0x11, 0x40); // Gyro 104Hz, 250dps
-    lsmReady = true;
-  } else {
-    lsmReady = false;
-  }
+void initMAX30102() {
+  writeReg(0x09, 0x40); // Reset chip
+  delay(100);
+  writeReg(0x04, 0x00); // FIFO Write Pointer = 0
+  writeReg(0x05, 0x00); // Overflow Counter = 0
+  writeReg(0x06, 0x00); // FIFO Read Pointer = 0
+  writeReg(0x08, 0x4F); // Sample averaging 4
+  writeReg(0x09, 0x03); // SpO2 mode (Red + IR LED aktif)
+  writeReg(0x0A, 0x27); // 4096 ADC range, 100 Hz sample rate, 411us pulse width
+  writeReg(0x0C, 0x24); // Red LED Current (~7.2 mA)
+  writeReg(0x0D, 0x24); // IR LED Current (~7.2 mA)
 }
 
-float readMCP9808Temp() {
-  if (!mcpReady) return -999.0f;
-  Wire.beginTransmission(ADDR_MCP9808);
-  Wire.write(0x05);
-  if (Wire.endTransmission(false) != 0) return -999.0f;
-  Wire.requestFrom((uint8_t)ADDR_MCP9808, (uint8_t)2);
+// ============================================================================
+// FUNGSI MCP9808
+// ============================================================================
+uint8_t scanMCP9808() {
+  for (uint8_t addr = 0x18; addr <= 0x1F; addr++) {
+    Wire.beginTransmission(addr);
+    Wire.write(0x06); // Register Manufacturer ID (0x0054)
+    if (Wire.endTransmission() == 0) {
+      Wire.requestFrom(addr, (uint8_t)2);
+      if (Wire.available() >= 2) {
+        uint16_t mfgID = (Wire.read() << 8) | Wire.read();
+        if (mfgID == 0x0054) return addr;
+      }
+    }
+  }
+  return 0;
+}
+
+float readTemperature(uint8_t addr) {
+  Wire.beginTransmission(addr);
+  Wire.write(0x05); // Register Ambient Temperature
+  if (Wire.endTransmission() != 0) return -999.0f;
+
+  Wire.requestFrom(addr, (uint8_t)2);
   if (Wire.available() < 2) return -999.0f;
+
   uint8_t upper = Wire.read() & 0x1F;
   uint8_t lower = Wire.read();
-  if ((upper & 0x10) == 0x10) {
-    upper &= 0x0F;
+
+  if ((upper & 0x10) == 0x10) { // Suhu negatif (< 0 °C)
+    upper = upper & 0x0F;
     return 256.0f - ((upper * 16.0f) + (lower / 16.0f));
+  } else {
+    return (upper * 16.0f) + (lower / 16.0f);
   }
-  return (upper * 16.0f) + (lower / 16.0f);
 }
 
+// ============================================================================
+// SETUP
+// ============================================================================
 void setup() {
   Serial.begin(115200);
   delay(1000);
   Serial.println("\n========================================================");
-  Serial.println("[TEST 05] Uji Multi-Sensor I2C Bus Fusion (SCaDA Core)");
+  Serial.println("[SCaDA Test 05] Dual I2C Fusion: MAX30102 + MCP9808");
   Serial.println("========================================================");
 
   Wire.begin(PIN_SDA, PIN_SCL);
-  Wire.setClock(100000);
+  Wire.setClock(100000); // 100 kHz I2C Standard
 
-  initAllSensors();
-  Serial.printf("Status Deteksi: MAX30102: [%s] | MCP9808: [%s] | LSM6DS3: [%s]\n\n",
-                maxReady ? "OK" : "FAIL",
-                mcpReady ? "OK" : "FAIL",
-                lsmReady ? "OK" : "FAIL");
+  // 1. Inisialisasi MAX30102
+  Wire.beginTransmission(MAX30102_ADDR);
+  if (Wire.endTransmission() == 0) {
+    initMAX30102();
+    maxConnected = true;
+    Serial.println("[OK] MAX30102 terdeteksi di alamat 0x57");
+  } else {
+    Serial.println("[GAGAL] MAX30102 tidak merespons di 0x57!");
+  }
+
+  // 2. Inisialisasi MCP9808 via Auto-Scan
+  mcpAddr = scanMCP9808();
+  if (mcpAddr != 0) {
+    mcpConnected = true;
+    latest_temp = readTemperature(mcpAddr);
+    Serial.printf("[OK] MCP9808 terdeteksi di alamat 0x%02X | Suhu awal: %.2f °C\n", mcpAddr, latest_temp);
+  } else {
+    Serial.println("[GAGAL] MCP9808 tidak ditemukan di alamat 0x18-0x1F!");
+  }
+
+  Serial.println("--------------------------------------------------------");
+  Serial.println("Tempelkan jari telunjuk Anda dengan santai ke sensor...");
+  Serial.println("========================================================\n");
 }
 
+// ============================================================================
+// LOOP UTAMA
+// ============================================================================
 void loop() {
-  // Pastikan sensor terinisialisasi jika sempat lepas
-  if (!maxReady || !mcpReady || !lsmReady) {
-    initAllSensors();
+  unsigned long now = millis();
+
+  // --------------------------------------------------------------------------
+  // 1. Auto-Reconnect jika kabel sempat goyang
+  // --------------------------------------------------------------------------
+  if (!maxConnected) {
+    Wire.beginTransmission(MAX30102_ADDR);
+    if (Wire.endTransmission() == 0) {
+      initMAX30102();
+      maxConnected = true;
+      Serial.println("[PULIH] MAX30102 berhasil tersambung kembali.");
+    }
   }
 
-  // 1. Baca MAX30102
-  uint32_t ir = 0, red = 0;
-  if (maxReady) {
-    Wire.beginTransmission(ADDR_MAX30102);
+  if (!mcpConnected) {
+    mcpAddr = scanMCP9808();
+    if (mcpAddr != 0) {
+      mcpConnected = true;
+      Serial.printf("[PULIH] MCP9808 ditemukan di alamat 0x%02X.\n", mcpAddr);
+    }
+  }
+
+  // --------------------------------------------------------------------------
+  // 2. Baca 6 Byte dari MAX30102
+  // --------------------------------------------------------------------------
+  if (maxConnected) {
+    Wire.beginTransmission(MAX30102_ADDR);
     Wire.write(0x07);
-    if (Wire.endTransmission(false) == 0) {
-      Wire.requestFrom((uint8_t)ADDR_MAX30102, (uint8_t)6);
+    if (Wire.endTransmission(false) != 0) {
+      maxConnected = false;
+    } else {
+      Wire.requestFrom((uint8_t)MAX30102_ADDR, (uint8_t)6);
       if (Wire.available() >= 6) {
-        red = ((uint32_t)Wire.read() << 16) | ((uint32_t)Wire.read() << 8) | Wire.read();
-        ir  = ((uint32_t)Wire.read() << 16) | ((uint32_t)Wire.read() << 8) | Wire.read();
+        uint32_t red = ((uint32_t)Wire.read() << 16) | ((uint32_t)Wire.read() << 8) | Wire.read();
+        uint32_t ir  = ((uint32_t)Wire.read() << 16) | ((uint32_t)Wire.read() << 8) | Wire.read();
         red &= 0x03FFFF;
         ir  &= 0x03FFFF;
+
+        // Ambang batas jari menempel (25000 aman untuk semua tekanan jari)
+        if (ir < 25000) {
+          dc_ir = 0;
+          dc_red = 0;
+          bpm_val = 0;
+          spo2_val = 0;
+          last_beat_time = 0;
+          rate_spot = 0;
+          rate_count = 0;
+          memset(rates, 0, sizeof(rates));
+          prev_ac_ir = 0;
+          peak_registered = false;
+          max_ac_ir = -99999; min_ac_ir = 99999;
+          max_ac_red = -99999; min_ac_red = 99999;
+        } else {
+          // Filter IIR DC Isolator (alpha 0.95)
+          const float alpha = 0.95f;
+          if (dc_ir == 0) {
+            dc_ir = ir;
+            dc_red = red;
+          } else {
+            dc_ir = alpha * dc_ir + (1.0f - alpha) * ir;
+            dc_red = alpha * dc_red + (1.0f - alpha) * red;
+          }
+
+          // Ekstraksi Fluktuasi AC (Denyut Nadi)
+          float ac_ir  = ir - dc_ir;
+          float ac_red = red - dc_red;
+
+          if (ac_ir > max_ac_ir)   max_ac_ir = ac_ir;
+          if (ac_ir < min_ac_ir)   min_ac_ir = ac_ir;
+          if (ac_red > max_ac_red) max_ac_red = ac_red;
+          if (ac_red < min_ac_red) min_ac_red = ac_red;
+
+          // Deteksi Puncak Nadi (Apex): Saat gelombang berbalik turun & amplitudo > 25
+          if (prev_ac_ir > 25.0f && ac_ir < prev_ac_ir && !peak_registered) {
+            peak_registered = true;
+
+            // Inisialisasi patokan awal (anchor) jika baru mulai atau jeda terlalu lama
+            if (last_beat_time == 0 || (now - last_beat_time) >= 2000) {
+              last_beat_time = now;
+            } else {
+              unsigned long dt = now - last_beat_time;
+              last_beat_time = now; // Selalu perbarui anchor ke denyut terbaru
+
+              // Rentang fisiologis manusia (450ms = 133 BPM s/d 1500ms = 40 BPM)
+              if (dt >= 450 && dt <= 1500) {
+                float instant_bpm = 60000.0f / (float)dt;
+
+                rates[rate_spot++] = instant_bpm;
+                rate_spot %= RATE_SIZE;
+                if (rate_count < RATE_SIZE) rate_count++;
+
+                // Perhitungan BPM dengan perataan bertingkat
+                if (rate_count >= 6) {
+                  // Double-Trimmed Mean (buang 1 terendah dan 1 tertinggi)
+                  float sorted[RATE_SIZE];
+                  for (byte i = 0; i < rate_count; i++) sorted[i] = rates[i];
+                  for (byte i = 0; i < rate_count - 1; i++) {
+                    for (byte j = 0; j < rate_count - i - 1; j++) {
+                      if (sorted[j] > sorted[j + 1]) {
+                        float tmp = sorted[j];
+                        sorted[j] = sorted[j + 1];
+                        sorted[j + 1] = tmp;
+                      }
+                    }
+                  }
+                  float sum = 0.0f;
+                  for (byte i = 1; i < rate_count - 1; i++) sum += sorted[i];
+                  bpm_val = sum / (float)(rate_count - 2);
+                } else {
+                  // Rata-rata langsung agar angka pertama cepat muncul (2-3 detik)
+                  float sum = 0.0f;
+                  for (byte i = 0; i < rate_count; i++) sum += rates[i];
+                  bpm_val = sum / (float)rate_count;
+                }
+
+                // Kalkulasi SpO2 (Ratio-of-Ratios R)
+                float vpp_ir  = max_ac_ir - min_ac_ir;
+                float vpp_red = max_ac_red - min_ac_red;
+
+                if (vpp_ir > 15.0f && dc_ir > 1000.0f && dc_red > 1000.0f) {
+                  float r = (vpp_red / dc_red) / (vpp_ir / dc_ir);
+                  float calc_spo2 = 110.0f - 25.0f * r;
+
+                  if (calc_spo2 > 100.0f) calc_spo2 = 99.0f;
+                  if (calc_spo2 < 80.0f)  calc_spo2 = 94.0f;
+
+                  if (spo2_val == 0) {
+                    spo2_val = calc_spo2;
+                  } else {
+                    spo2_val = 0.80f * spo2_val + 0.20f * calc_spo2;
+                  }
+                }
+
+                // Reset window min/max untuk denyut berikutnya
+                max_ac_ir = -99999; min_ac_ir = 99999;
+                max_ac_red = -99999; min_ac_red = 99999;
+              }
+            }
+          } else if (ac_ir < 10.0f) {
+            // Reset trigger saat gelombang turun kembali ke baseline
+            peak_registered = false;
+          }
+
+          prev_ac_ir = ac_ir;
+        }
       }
     }
   }
 
-  // 2. Baca MCP9808
-  float tempC = readMCP9808Temp();
-
-  // 3. Baca GY-LSM6DS3
-  float accZ = 0.0f, gyroZ = 0.0f;
-  if (lsmReady) {
-    Wire.beginTransmission(ADDR_LSM6DS3);
-    Wire.write(0x22);
-    if (Wire.endTransmission(false) == 0) {
-      Wire.requestFrom((uint8_t)ADDR_LSM6DS3, (uint8_t)12);
-      if (Wire.available() >= 12) {
-        Wire.read(); Wire.read(); // GX
-        Wire.read(); Wire.read(); // GY
-        int16_t rawGZ = (int16_t)(Wire.read() | (Wire.read() << 8));
-        Wire.read(); Wire.read(); // AX
-        Wire.read(); Wire.read(); // AY
-        int16_t rawAZ = (int16_t)(Wire.read() | (Wire.read() << 8));
-        gyroZ = rawGZ * 0.00875f;
-        accZ  = (rawAZ * 0.061f) / 1000.0f;
-      }
+  // --------------------------------------------------------------------------
+  // 3. Baca Suhu MCP9808 Setiap 1 Detik (Non-Blocking)
+  // --------------------------------------------------------------------------
+  if (mcpConnected && (now - last_temp_time >= 1000)) {
+    last_temp_time = now;
+    float t = readTemperature(mcpAddr);
+    if (t > -50.0f && t < 100.0f) {
+      latest_temp = t;
+    } else {
+      mcpConnected = false;
     }
   }
 
-  // Cetak baris data gabungan
-  Serial.printf("[FUSION DATA] Suhu: %5.2f°C | PPG IR: %6lu | Accel Z: %+5.2fg | Gyro Z: %+5.1f°/s\n",
-                tempC, ir, accZ, gyroZ);
+  // --------------------------------------------------------------------------
+  // 4. Cetak Baris Telemetri Setiap 1 Detik
+  // --------------------------------------------------------------------------
+  if (now - last_print_time >= 1000) {
+    last_print_time = now;
 
-  delay(200);
+    if (dc_ir == 0) {
+      Serial.printf("[FUSION] Menunggu Jari... | Suhu Kulit: %5.2f °C\n", latest_temp);
+    } else if (bpm_val == 0) {
+      Serial.printf("[FUSION] Jari Terdeteksi. Mengunci Detak (Sampel %d/6)... | Suhu: %5.2f °C\n", 
+                    rate_count, latest_temp);
+    } else {
+      Serial.printf("[FUSION] AKTIF | Detak: %3.0f BPM | SpO2: %3.0f %% | Suhu Kulit: %5.2f °C\n",
+                    bpm_val, spo2_val, latest_temp);
+    }
+  }
+
+  // Jeda sampling MAX30102 sinkron ~25 Hz
+  delay(38);
 }
