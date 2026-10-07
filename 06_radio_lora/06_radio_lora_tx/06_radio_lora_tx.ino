@@ -22,7 +22,7 @@
 #define LORA_RST   14
 #define LORA_DIO0  2
 
-long activeFrequency = 915000000L;
+long activeFrequency = 433000000L; // 433 MHz (Sesuai spesifikasi modul Ra-02: 410 - 525 MHz)
 int packetCounter = 0;
 
 void setup() {
@@ -54,16 +54,12 @@ void setup() {
     Serial.println("        Program dihentikan untuk mencegah kerusakan.\n");
     while (1) { delay(1000); }
   }
-  Serial.println("[SPI CHECK] Modul SX1276 terdeteksi normal (0x12). Melanjutkan inisialisasi RF...");
+  Serial.println("[SPI CHECK] Modul SX1276/SX1278 terdeteksi normal (0x12). Melanjutkan inisialisasi RF...");
 
-  // 3. Inisialisasi Frekuensi Radio (915 MHz atau fallback 433 MHz)
-  if (!LoRa.begin(915000000L)) {
-    Serial.println("[INFO] Gagal pada 915 MHz, mencoba frekuensi 433 MHz...");
-    if (!LoRa.begin(433000000L)) {
-      Serial.println("[GAGAL] Radio LoRa tidak dapat diaktifkan!");
-      while (1);
-    }
-    activeFrequency = 433000000L;
+  // 3. Inisialisasi Frekuensi Radio (433 MHz untuk modul Ra-02 410-525 MHz)
+  if (!LoRa.begin(activeFrequency)) {
+    Serial.println("[GAGAL] Radio LoRa tidak dapat diaktifkan pada 433 MHz!");
+    while (1);
   }
 
   // 3. Konfigurasi Parameter RF Pengirim
